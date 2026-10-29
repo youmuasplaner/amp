@@ -1,0 +1,1202 @@
+
+d /home/computerspende/Schreibtisch/amp && nano src/App.tsximport React, { useEffect, useMemo, useRef, useState } from "react";
+
+// ---------------- Typen ----------------
+
+interface Doses {
+  mo: number;
+  di: number;
+  mi: number;
+  do: number;
+  fr: number;
+  sa: number;
+  so: number;
+}
+
+interface Med {
+  id: string;
+  name: string;
+  form: "tabletten" | "kapseln" | "tropfen" | "saft" | "sonstige";
+  retard: boolean; // retardiert (ret.) oder nicht retardiert
+  strength: number; // Wirkstärke: 1. numerischer Wert
+  strengthUnit: "mg" | "ml" | "u" | "ratio"; // Einheit: mg, ml, µ oder „x/y“
+  strengthY: number; // 2. numerischer Wert bei „x/y“ (z. B. 5/1000)
+  extra1: string; // Freifeld 1 (max. 10 Stellen)
+  extra2: string; // Freifeld 2 (max. 10 Stellen)
+  extra3: string; // Freifeld 3 (max. 10 Stellen)
+  packLabel: string; // N1 / N2 / N3 oder Größenangabe
+  packUnits: number; // Inhalt pro Packung (Stück bzw. ml)
+  packsAtHome: number; // Grundbestand (Packungen)
+  currentStock: number; // aktueller Bestand (Stück bzw. ml)
+  stockAsOf: string; // ISO-Datum, an dem der Bestand gezählt wurde
+  doses: Doses;
+  uniformDose: boolean; // true = eine Eingabe „pro Tag“ gilt für alle (gezählten) Wochentage
+  countWeekend: boolean; // Sa/So mitzählen? Standard: ja (jeder Wochentag)
+  doctorLead: number; // Vorlauf Arzt in Werktagen
+  pharmacyLead: number; // Vorlauf Apotheke in Werktagen
+  pickupSelf: boolean; // Abholung: 1. Selbst (as)
+  reps: string[]; // Abholung: 2.–4. Vertreten durch
+  price: number; // Abgabepreis pro Packung (€)
+  feeDespiteExemption: boolean; // zuzahlungspflichtig trotz Härtefall
+  feeOverride: number | null; // manuelle Zuzahlung (€)
+  note: string;
+  active: boolean; // abgewählt (inaktiv) – Standard: aktiv
+}
+
+interface Settings {
+  haertefall: boolean;
+}
+
+// ---------------- Konstanten & Helfer ----------------
+
+const WD_KEYS: (keyof Doses)[] = ["so", "mo", "di", "mi", "do", "fr", "sa"]; // Index = Date.getDay()
+const WD_ORDER: (keyof Doses)[] = ["mo", "di", "mi", "do", "fr", "sa", "so"];
+const WD_LABELS: Record<keyof Doses, string> = {
+  mo: "Mo", di: "Di", mi: "Mi", do: "Do", fr: "Fr", sa: "Sa", so: "So",
+};
+
+const unitOf = (m: Med): string => (m.form === "tropfen" || m.form === "saft") ? "ml" : "St";
+
+function todayISO(): string {
+  const d = new Date();
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+function parseISO(iso: string): Date {
+  return new Date(iso + "T00:00:00");
+}
+
+const fmt = (d: Date) =>
+  d.toLocaleDateString("de-DE", { weekday: "short", day: "2-digit", month: "2-digit", year: "numeric" });
+
+const fmtEuro = (v: number) =>
+  v.toLocaleString("de-DE", { style: "currency", currency: "EUR" });
+
+function doseFor(med: Med, date: Date): number {
+  const key = WD_KEYS[date.getDay()];
+  if (!med.countWeekend && (key === "sa" || key === "so")) return 0;
+  return med.doses[key] ?? 0;
+}
+
+function weeklyDose(med: Med): number {
+  let sum = 0;
+  for (const k of WD_ORDER) {
+    if (!med.countWeekend && (k === "sa" || k === "so")) continue;
+    sum += med.doses[k] || 0;
+  }
+  return sum;
+}
+
+/** Werktage zwischen heute (exklusiv) und Ziel (inklusiv); negativ = überfällig */
+function workdaysUntil(target: Date): number {
+  const today = parseISO(todayISO());
+  const t = new Date(target);
+  today.setHours(0, 0, 0, 0);
+  t.setHours(0, 0, 0, 0);
+  let n = 0;
+  if (t < today) {
+    let d = new Date(today);
+    while (d > t) {
+      d.setDate(d.getDate() - 1);
+      const wd = d.getDay();
+      if (wd !== 0 && wd !== 6) n--;
+    }
+    return n;
+  }
+  let d = new Date(today);
+  while (d < t) {
+    d.setDate(d.getDate() + 1);
+    const wd = d.getDay();
+    if (wd !== 0 && wd !== 6) n++;
+  }
+  return n;
+}
+
+/** Geht n Werktage rückwärts vom Datum */
+function subtractWorkdays(from: Date, n: number): Date {
+  const d = new Date(from);
+  let left = Math.max(0, Math.round(n));
+  while (left > 0) {
+    d.setDate(d.getDate() - 1);
+    const wd = d.getDay();
+    if (wd !== 0 && wd !== 6) left--;
+  }
+  return d;
+}
+
+interface Schedule {
+  med: Med;
+  emptyDate: Date | null; // Packung exakt/bis auf Rest leer
+  doctorDate: Date | null; // späteste Verschreibung beim Arzt
+  pharmacyDate: Date | null; // späteste Bestellung in der Apotheke
+  weekly: number;
+  daysToEmpty: number; // Werktage bis leer
+  daysToDoctor: number; // Werktage bis späteste Arzt-Verschreibung
+  status: "leer" | "sofort" | "dringend" | "bald" | "ok" | "unbekannt";
+}
+
+function computeSchedule(med: Med): Schedule {
+  const weekly = weeklyDose(med);
+  const start = parseISO(med.stockAsOf);
+  let emptyDate: Date | null = null;
+
+  if (med.currentStock <= 0) {
+    emptyDate = start;
+  } else if (weekly > 0) {
+    let stock = med.currentStock;
+    const d = new Date(start);
+    for (let i = 0; i < 2000; i++) {
+      const dose = doseFor(med, d);
+      if (dose > 0) {
+        if (stock - dose < dose) {
+          emptyDate = new Date(d);
+          break;
+        }
+        stock -= dose;
+        if (stock <= 0) {
+          emptyDate = new Date(d);
+          break;
+        }
+      }
+      d.setDate(d.getDate() + 1);
+    }
+  }
+
+  const doctorDate = emptyDate ? subtractWorkdays(emptyDate, med.doctorLead) : null;
+  const pharmacyDate = emptyDate ? subtractWorkdays(emptyDate, med.pharmacyLead) : null;
+
+  let status: Schedule["status"] = "unbekannt";
+  let daysToEmpty = 0;
+  let daysToDoctor = 0;
+  if (emptyDate) {
+    daysToEmpty = workdaysUntil(emptyDate);
+    daysToDoctor = doctorDate ? workdaysUntil(doctorDate) : 0;
+    if (med.currentStock <= 0) status = "leer";
+    else if (daysToEmpty <= 0) status = "sofort";
+    else if (daysToDoctor <= 0) status = "sofort";
+    else if (daysToDoctor <= 2) status = "dringend";
+    else if (daysToDoctor <= 5) status = "bald";
+    else status = "ok";
+  }
+  return { med, emptyDate, doctorDate, pharmacyDate, weekly, daysToEmpty, daysToDoctor, status };
+}
+
+function calcFee(med: Med, haertefall: boolean): number | null {
+  if (med.feeOverride !== null && !Number.isNaN(med.feeOverride)) return med.feeOverride;
+  if (haertefall && !med.feeDespiteExemption) return 0;
+  if (med.price > 0) return Math.min(10, Math.max(5, med.price * 0.1));
+  return null; // Preis unbekannt
+}
+
+function newId(): string {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+}
+
+function defaultMed(): Med {
+  return {
+    id: newId(),
+    name: "",
+    form: "tabletten",
+    retard: false,
+    strength: 0,
+    strengthUnit: "mg",
+    strengthY: 0,
+    extra1: "",
+    extra2: "",
+    extra3: "",
+    packLabel: "N3",
+    packUnits: 100,
+    packsAtHome: 1,
+    currentStock: 0,
+    stockAsOf: todayISO(),
+    doses: { mo: 1, di: 1, mi: 1, do: 1, fr: 1, sa: 1, so: 1 },
+    uniformDose: true,
+    countWeekend: true,
+    doctorLead: 5,
+    pharmacyLead: 3,
+    pickupSelf: true,
+    reps: ["", "", ""],
+    price: 0,
+    feeDespiteExemption: false,
+    feeOverride: null,
+    note: "",
+    active: true,
+  };
+}
+
+function seedMeds(): Med[] {
+  const base = defaultMed();
+  return [
+    {
+      ...base, id: newId(), name: "Hygroton 25 mg", form: "tabletten", packLabel: "N3",
+      packUnits: 100, packsAtHome: 1, currentStock: 5, stockAsOf: todayISO(),
+      doses: { mo: 1, di: 1, mi: 1, do: 1, fr: 1, sa: 1, so: 1 },
+      price: 23.5, pickupSelf: false, reps: ["Apotheken-Botendienst", "", ""],
+      strength: 25, strengthUnit: "mg", retard: false,
+      note: "Beispiel – bitte anpassen.",
+    },
+    {
+      ...base, id: newId(), name: "Levothyroxin 100 µg", form: "tabletten", packLabel: "N3",
+      packUnits: 100, packsAtHome: 2, currentStock: 62, stockAsOf: todayISO(),
+      doses: { mo: 1, di: 1, mi: 1, do: 1, fr: 1, sa: 1, so: 1 },
+      price: 18.9, pickupSelf: false, reps: ["Ehepartner", "", ""],
+      strength: 100, strengthUnit: "u", retard: false,
+      note: "Beispiel – bitte anpassen.",
+    },
+  ];
+}
+
+/** Gleicht alte/teilweise Daten ab: fehlende Felder ergänzen, Dosis-Modus ableiten */
+function normalizeMed(raw: Partial<Med>): Med {
+  const base = defaultMed();
+  const m: Med = { ...base, ...raw };
+  m.doses = { ...base.doses, ...(raw.doses ?? {}) };
+  // Migration: altes Feld „pickupBy“ in die neue Struktur übernehmen
+  if (!Array.isArray(raw.reps)) {
+    const legacy = raw as Record<string, unknown>;
+    const old = typeof legacy.pickupBy === "string" ? legacy.pickupBy.trim() : "";
+    m.reps = old ? [old, "", ""] : ["", "", ""];
+    m.pickupSelf = raw.pickupSelf === undefined ? !old : !!raw.pickupSelf;
+  }
+  m.active = raw.active === undefined ? true : !!raw.active;
+  if (raw.uniformDose === undefined) {
+    const counted = WD_ORDER.filter((k) => m.countWeekend || (k !== "sa" && k !== "so"));
+    const vals = counted.map((k) => m.doses[k] ?? 0);
+    m.uniformDose = vals.every((v) => v === vals[0]);
+  }
+  return m;
+}
+
+// ---------------- Persistenz ----------------
+
+const STORE_KEY = "medikamentenplaner-v1";
+
+function loadStore(): { meds: Med[]; settings: Settings } {
+  try {
+    // Einmalige Migration: alten Key mit Bindestrich übernehmen, falls vorhanden
+    let raw = localStorage.getItem(STORE_KEY);
+    if (!raw) {
+      const legacy = localStorage.getItem("medikamenten-planer-v1");
+      if (legacy) {
+        localStorage.setItem(STORE_KEY, legacy);
+        raw = legacy;
+      }
+    }
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && Array.isArray(parsed.meds)) {
+        return {
+          meds: parsed.meds.map((x: unknown) => normalizeMed(x as Partial<Med>)),
+          settings: { haertefall: parsed.settings ? !!parsed.settings.haertefall : true },
+        };
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  return { meds: seedMeds(), settings: { haertefall: true } };
+}
+
+// ---------------- UI-Bausteine ----------------
+
+const STATUS_STYLES: Record<Schedule["status"], { label: string; cls: string }> = {
+  leer: { label: "leer!", cls: "bg-red-100 text-red-800 border-red-300" },
+  sofort: { label: "sofort handeln!", cls: "bg-red-100 text-red-800 border-red-300" },
+  dringend: { label: "dringend", cls: "bg-orange-100 text-orange-800 border-orange-300" },
+  bald: { label: "bald", cls: "bg-amber-100 text-amber-800 border-amber-300" },
+  ok: { label: "OK", cls: "bg-green-100 text-green-800 border-green-300" },
+  unbekannt: { label: "unbekannt", cls: "bg-slate-100 text-slate-600 border-slate-300" },
+};
+
+function Field({ label, children, hint }: { label: string; children: React.ReactNode; hint?: string }) {
+  return (
+    <label className="block">
+      <span className="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-500">{label}</span>
+      {children}
+      {hint && <span className="mt-1 block text-xs text-slate-400">{hint}</span>}
+    </label>
+  );
+}
+
+const inputCls =
+  "w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 shadow-sm focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-200";
+
+function NumInput({ value, onChange, step = 1, min = 0, suffix }: {
+  value: number;
+  onChange: (v: number) => void;
+  step?: number;
+  min?: number;
+  suffix?: string;
+}) {
+  return (
+    <div className="relative">
+      <input
+        type="number"
+        className={inputCls + (suffix ? " pr-10" : "")}
+        value={Number.isNaN(value) ? "" : value}
+        step={step}
+        min={min}
+        onChange={(e) => onChange(e.target.value === "" ? 0 : parseFloat(e.target.value))}
+      />
+      {suffix && (
+        <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-slate-400">
+          {suffix}
+        </span>
+      )}
+    </div>
+  );
+}
+
+/** Abholung: 1. Selbst (as), 2.–4. Vertreten durch – als Liste für die Tabelle */
+function pickupList(med: Med): React.ReactNode {
+  const parts: string[] = [];
+  if (med.pickupSelf) parts.push("1. Selbst (as)");
+  med.reps.forEach((r, i) => {
+    if (r && r.trim()) parts.push(`${i + 2}. ${r.trim()}`);
+  });
+  if (parts.length === 0) return <span className="text-slate-400">– noch offen –</span>;
+  return (
+    <div className="text-slate-700">
+      {parts.map((p, i) => (
+        <div key={i}>{p}</div>
+      ))}
+    </div>
+  );
+}
+
+/** Wirkstärke als Text: „25 mg“, „100 µ“ oder „x/y“-Form wie „5/1000“ */
+function strengthText(med: Med): string {
+  if (med.strengthUnit === "ratio") {
+    if (med.strength > 0) return `${med.strength}/${med.strengthY > 0 ? med.strengthY : ""}`;
+    return "";
+  }
+  if (med.strength > 0) {
+    const unit = med.strengthUnit === "u" ? "µ" : med.strengthUnit;
+    return `${med.strength} ${unit}`;
+  }
+  return "";
+}
+
+/** Gefüllte Freifelder als kompakte Zeile */
+function extrasText(med: Med): string {
+  return [med.extra1, med.extra2, med.extra3]
+    .map((e) => (e || "").trim())
+    .filter(Boolean)
+    .join(" · ");
+}
+
+function doseSummary(med: Med): string {
+  const active = WD_ORDER.filter(
+    (k) => med.doses[k] > 0 && (med.countWeekend || (k !== "sa" && k !== "so"))
+  );
+  if (active.length === 0) return "kein Verbrauch erfasst";
+  const unit = unitOf(med);
+  const doseSet = new Set(active.map((k) => med.doses[k]));
+  const perDay = doseSet.size === 1 ? `${med.doses[active[0]]} ${unit}` : "variabel";
+  return `${perDay}/Tag · ${active.map((k) => WD_LABELS[k]).join(", ")}`;
+}
+
+// ---------------- Formular ----------------
+
+function MedForm({ draft, onSave, onCancel, onDelete }: {
+  draft: Med;
+  onSave: (m: Med) => void;
+  onCancel: () => void;
+  onDelete?: () => void;
+}) {
+  const [m, setM] = useState<Med>(draft);
+  const [autofillDays, setAutofillDays] = useState(true);
+  const touchedDays = useRef<Set<keyof Doses>>(new Set());
+  const upd = <K extends keyof Med>(k: K, v: Med[K]) => setM((prev) => ({ ...prev, [k]: v }));
+  const updDose = (k: keyof Doses, v: number) => {
+    touchedDays.current.add(k);
+    setM((prev) => {
+      // Option: Die erste Eingabe füllt automatisch alle übrigen (noch nicht
+      // individuell bestimmten) Tagesfelder mit demselben Wert aus.
+      if (!prev.uniformDose && autofillDays) {
+        const doses = { ...prev.doses, [k]: v };
+        for (const day of WD_ORDER) {
+          if (day !== k && !touchedDays.current.has(day)) doses[day] = v;
+        }
+        return { ...prev, doses };
+      }
+      return { ...prev, doses: { ...prev.doses, [k]: v } };
+    });
+  };
+  const unit = unitOf(m);
+  const isNew = !m.name;
+
+  return (
+    <div className="rounded-xl border border-indigo-200 bg-indigo-50/50 p-4 shadow-sm">
+      <h3 className="mb-3 text-base font-bold text-indigo-900">
+        {isNew ? "➕ Neues Medikament erfassen" : `✏️ Bearbeiten: ${m.name}`}
+      </h3>
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+        <Field label="Medikament / Wirkstoff">
+          <input
+            className={inputCls}
+            value={m.name}
+            placeholder="z. B. Hygroton 25 mg"
+            onChange={(e) => upd("name", e.target.value)}
+          />
+        </Field>
+        <Field label="Darreichungsform">
+          <select
+            className={inputCls}
+            value={m.form}
+            onChange={(e) => upd("form", e.target.value as Med["form"])}
+          >
+            <option value="tabletten">Tabletten</option>
+            <option value="kapseln">Kapseln</option>
+            <option value="tropfen">Tropfen (flüssig)</option>
+            <option value="saft">Saft/Suspension (flüssig)</option>
+            <option value="sonstige">Sonstige</option>
+          </select>
+        </Field>
+        <Field label="Retard?" hint="retardiert (ret.) = verzögerte Wirkstofffreisetzung">
+          <select
+            className={inputCls}
+            value={m.retard ? "ret" : "nicht"}
+            onChange={(e) => upd("retard", e.target.value === "ret")}
+          >
+            <option value="nicht">nicht ret.</option>
+            <option value="ret">ret.</option>
+          </select>
+        </Field>
+        <Field
+          label="Wirkstärke / Einheit"
+          hint="Einheit wählen; bei „x/y“ zwei numerische Werte (z. B. 5/1000)"
+        >
+          <div className="flex gap-2">
+            <select
+              className={inputCls + " w-24"}
+              value={m.strengthUnit}
+              onChange={(e) => upd("strengthUnit", e.target.value as Med["strengthUnit"])}
+            >
+              <option value="mg">mg</option>
+              <option value="ml">ml</option>
+              <option value="u">µ</option>
+              <option value="ratio">x/y</option>
+            </select>
+            {m.strengthUnit === "ratio" ? (
+              <div className="flex flex-1 items-center gap-1">
+                <NumInput value={m.strength} onChange={(v) => upd("strength", v)} />
+                <span className="font-semibold text-slate-400">/</span>
+                <NumInput value={m.strengthY} onChange={(v) => upd("strengthY", v)} />
+              </div>
+            ) : (
+              <NumInput value={m.strength} onChange={(v) => upd("strength", v)} />
+            )}
+          </div>
+        </Field>
+        <Field label="Packungsgröße (Kennzeichnung)" hint="z. B. N1 / N2 / N3 oder „100 ml“">
+          <input
+            className={inputCls}
+            value={m.packLabel}
+            placeholder="N3"
+            onChange={(e) => upd("packLabel", e.target.value)}
+          />
+        </Field>
+        <Field label={`Inhalt pro Packung (${unit})`} hint="Anzahl Tabletten bzw. ml je Packung">
+          <NumInput value={m.packUnits} onChange={(v) => upd("packUnits", v)} suffix={unit} />
+        </Field>
+        <Field label="Grundbestand (Packungen)" hint="Wie viele Packungen normalerweise vorrätig sein sollen">
+          <NumInput value={m.packsAtHome} onChange={(v) => upd("packsAtHome", v)} min={0} suffix="Pck." />
+        </Field>
+        <Field label={`Aktueller Bestand (${unit})`} hint="Jetzt tatsächlich vorrätige Menge (abgezählt)">
+          <NumInput
+            value={m.currentStock}
+            onChange={(v) => upd("currentStock", v)}
+            step={unit === "ml" ? 0.1 : 0.5}
+            suffix={unit}
+          />
+        </Field>
+        <Field label="Bestand gezählt am">
+          <input
+            type="date"
+            className={inputCls}
+            value={m.stockAsOf}
+            onChange={(e) => upd("stockAsOf", e.target.value)}
+          />
+        </Field>
+        <Field label="Abholung durch wen?" hint="Wer holt das Medikament in der Apotheke ab">
+          <label className="mb-2 flex items-center gap-2 rounded-md border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700">
+            <input
+              type="checkbox"
+              className="h-4 w-4 rounded border-slate-300 text-indigo-600"
+              checked={m.pickupSelf}
+              onChange={(e) => upd("pickupSelf", e.target.checked)}
+            />
+            1. Selbst (as)
+          </label>
+          {m.reps.map((r, i) => (
+            <input
+              key={i}
+              className={inputCls + (i < m.reps.length - 1 ? " mb-2" : "")}
+              value={r}
+              placeholder={`${i + 2}. Vertreten durch: z. B. ${
+                ["Ehepartner", "Pflegedienst", "Botendienst"][i]
+              }`}
+              onChange={(e) =>
+                setM((prev) => ({
+                  ...prev,
+                  reps: prev.reps.map((x, idx) => (idx === i ? e.target.value : x)),
+                }))
+              }
+            />
+          ))}
+        </Field>
+        <Field label="Abgabepreis pro Packung (€)" hint="Für die Zuzahlungs-Berechnung">
+          <NumInput value={m.price} onChange={(v) => upd("price", v)} step={0.01} suffix="€" />
+        </Field>
+        <Field label="Vorlauf Arzt (Werktage)" hint="So viele Werktage VOR Leer-Datum verschreiben lassen">
+          <NumInput value={m.doctorLead} onChange={(v) => upd("doctorLead", v)} suffix="Tage" />
+        </Field>
+        <Field label="Vorlauf Apotheke (Werktage)" hint="So viele Werktage VOR Leer-Datum bestellen">
+          <NumInput value={m.pharmacyLead} onChange={(v) => upd("pharmacyLead", v)} suffix="Tage" />
+        </Field>
+        <Field label="Notiz">
+          <input className={inputCls} value={m.note} placeholder="optional" onChange={(e) => upd("note", e.target.value)} />
+        </Field>
+        <Field label="Freifeld 1" hint="freie Eingabe, max. 10 Stellen">
+          <input
+            className={inputCls}
+            maxLength={10}
+            value={m.extra1}
+            placeholder="max. 10 Stellen"
+            onChange={(e) => upd("extra1", e.target.value)}
+          />
+        </Field>
+        <Field label="Freifeld 2" hint="freie Eingabe, max. 10 Stellen">
+          <input
+            className={inputCls}
+            maxLength={10}
+            value={m.extra2}
+            placeholder="max. 10 Stellen"
+            onChange={(e) => upd("extra2", e.target.value)}
+          />
+        </Field>
+        <Field label="Freifeld 3" hint="freie Eingabe, max. 10 Stellen">
+          <input
+            className={inputCls}
+            maxLength={10}
+            value={m.extra3}
+            placeholder="max. 10 Stellen"
+            onChange={(e) => upd("extra3", e.target.value)}
+          />
+        </Field>
+      </div>
+
+      <div className="mt-4 rounded-lg border border-slate-200 bg-white p-3">
+        <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+          <span className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+            Tabletten/Verbrauch laut Verschreibung ({unit} pro Tag)
+          </span>
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="flex overflow-hidden rounded-md border border-slate-300 text-xs font-semibold">
+              <button
+                type="button"
+                onClick={() =>
+                  setM((prev) => {
+                    if (prev.uniformDose) return prev;
+                    const ref = prev.doses.mo > 0 ? prev.doses.mo : prev.doses.di > 0 ? prev.doses.di : 1;
+                    return {
+                      ...prev,
+                      uniformDose: true,
+                      doses: {
+                        mo: ref, di: ref, mi: ref, do: ref, fr: ref,
+                        sa: prev.countWeekend ? ref : 0,
+                        so: prev.countWeekend ? ref : 0,
+                      },
+                    };
+                  })
+                }
+                className={
+                  m.uniformDose
+                    ? "bg-indigo-600 px-2.5 py-1 text-white"
+                    : "bg-white px-2.5 py-1 text-slate-600 hover:bg-slate-50"
+                }
+              >
+                An allen Tagen gleich
+              </button>
+              <button
+                type="button"
+                onClick={() => upd("uniformDose", false)}
+                className={
+                  !m.uniformDose
+                    ? "bg-indigo-600 px-2.5 py-1 text-white"
+                    : "bg-white px-2.5 py-1 text-slate-600 hover:bg-slate-50"
+                }
+              >
+                Pro Wochentag einzeln
+              </button>
+            </div>
+            {!m.uniformDose && (
+              <label className="flex items-center gap-2 rounded-md border border-indigo-200 bg-indigo-50 px-2.5 py-1 text-xs font-semibold text-indigo-700">
+                <input
+                  type="checkbox"
+                  className="h-4 w-4 rounded border-slate-300 text-indigo-600"
+                  checked={autofillDays}
+                  onChange={(e) => {
+                    setAutofillDays(e.target.checked);
+                    touchedDays.current.clear();
+                  }}
+                />
+                🪄 1. Eingabe füllt alle übrigen Tage automatisch aus
+              </label>
+            )}
+            <label className="flex items-center gap-2 text-xs text-slate-600">
+              <input
+                type="checkbox"
+                className="h-4 w-4 rounded border-slate-300 text-indigo-600"
+                checked={m.countWeekend}
+                onChange={(e) => {
+                  const on = e.target.checked;
+                  setM((prev) => {
+                    if (prev.uniformDose) {
+                      const v = prev.doses.mo;
+                      return {
+                        ...prev,
+                        countWeekend: on,
+                        doses: { mo: v, di: v, mi: v, do: v, fr: v, sa: on ? v : 0, so: on ? v : 0 },
+                      };
+                    }
+                    return { ...prev, countWeekend: on };
+                  });
+                }}
+              />
+              Wochenende (Sa/So) mitzählen
+            </label>
+            <button
+              type="button"
+              onClick={() => {
+                setM((prev) => {
+                  const ref = prev.uniformDose ? prev.doses.mo : prev.doses.mo > 0 ? prev.doses.mo : 1;
+                  return {
+                    ...prev,
+                    countWeekend: true,
+                    doses: { mo: ref, di: ref, mi: ref, do: ref, fr: ref, sa: ref, so: ref },
+                  };
+                });
+              }}
+              className="rounded-md border border-indigo-300 bg-indigo-50 px-2.5 py-1 text-xs font-semibold text-indigo-700 hover:bg-indigo-100"
+            >
+              ↔ Einnahme auf jeden Wochentag (Mo–So) setzen
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setM((prev) => {
+                  const ref = prev.uniformDose ? prev.doses.mo : prev.doses.mo > 0 ? prev.doses.mo : 1;
+                  return {
+                    ...prev,
+                    countWeekend: false,
+                    doses: { mo: ref, di: ref, mi: ref, do: ref, fr: ref, sa: 0, so: 0 },
+                  };
+                });
+              }}
+              className="rounded-md border border-slate-300 bg-white px-2.5 py-1 text-xs font-semibold text-slate-600 hover:bg-slate-50"
+            >
+              Nur Mo–Fr
+            </button>
+          </div>
+        </div>
+        {m.uniformDose ? (
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <Field
+              label={`Einnahme pro Tag (${unit})`}
+              hint="Gilt automatisch für alle zugehörigen Wochentage – hier genügt eine einzige Eingabe"
+            >
+              <NumInput
+                value={m.doses.mo}
+                step={unit === "ml" ? 0.1 : 0.5}
+                suffix={unit}
+                onChange={(v) =>
+                  setM((prev) => ({
+                    ...prev,
+                    doses: {
+                      mo: v, di: v, mi: v, do: v, fr: v,
+                      sa: prev.countWeekend ? v : 0,
+                      so: prev.countWeekend ? v : 0,
+                    },
+                  }))
+                }
+              />
+            </Field>
+          </div>
+        ) : (
+        <div className="grid grid-cols-7 gap-2">
+          {WD_ORDER.map((k) => {
+            const inactive = !m.countWeekend && (k === "sa" || k === "so");
+            return (
+              <div key={k}>
+                <span
+                  className={
+                    "mb-1 block text-center text-xs font-semibold " +
+                    (inactive ? "text-slate-300" : "text-slate-600")
+                  }
+                >
+                  {WD_LABELS[k]}
+                </span>
+                <input
+                  type="number"
+                  step={unit === "ml" ? 0.1 : 0.5}
+                  min={0}
+                  disabled={inactive}
+                  value={Number.isNaN(m.doses[k]) ? "" : m.doses[k]}
+                  onChange={(e) => updDose(k, e.target.value === "" ? 0 : parseFloat(e.target.value))}
+                  className={
+                    inputCls +
+                    " px-1 text-center disabled:bg-slate-50 disabled:text-slate-300"
+                  }
+                />
+              </div>
+            );
+          })}
+        </div>
+        )}
+        <p className="mt-2 text-xs text-slate-400">
+          Standard-Modus „An allen Tagen gleich“: Eine einzige Eingabe „pro Tag“ gilt automatisch für
+          alle zugehörigen Wochentage (Mo–So, also auch am Wochenende). Im Modus „Pro Wochentag
+          einzeln“ füllt die 🪄-Option die erste Eingabe automatisch auf alle übrigen Tage aus – Tage,
+          die danach individuell bestimmt wurden, bleiben unverändert. Deaktiviert man die Option,
+          gilt jede Eingabe nur für den jeweiligen Tag.
+        </p>
+      </div>
+
+      <div className="mt-3 flex flex-wrap items-center gap-4">
+        <label className="flex items-center gap-2 text-sm text-slate-700">
+          <input
+            type="checkbox"
+            className="h-4 w-4 rounded border-slate-300 text-indigo-600"
+            checked={m.feeDespiteExemption}
+            onChange={(e) => upd("feeDespiteExemption", e.target.checked)}
+          />
+          Zuzahlungspflichtig trotz Härtefallstatus
+        </label>
+        <div className="flex items-center gap-2 text-sm text-slate-700">
+          <span className="whitespace-nowrap">Zuzahlung manuell (€, leer = automatisch):</span>
+          <input
+            type="number"
+            step={0.01}
+            min={0}
+            className={inputCls + " w-28"}
+            value={m.feeOverride === null ? "" : m.feeOverride}
+            placeholder="auto"
+            onChange={(e) => upd("feeOverride", e.target.value === "" ? null : parseFloat(e.target.value))}
+          />
+        </div>
+      </div>
+
+      <div className="mt-4 flex flex-wrap gap-2">
+        <button
+          onClick={() => onSave(m)}
+          className="rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow hover:bg-indigo-700"
+        >
+          Speichern
+        </button>
+        <button
+          onClick={onCancel}
+          className="rounded-md border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-700 shadow-sm hover:bg-slate-50"
+        >
+          Abbrechen
+        </button>
+        {onDelete && (
+          <button
+            onClick={onDelete}
+            className="ml-auto rounded-md border border-red-300 bg-white px-4 py-2 text-sm font-semibold text-red-700 shadow-sm hover:bg-red-50"
+          >
+            Löschen
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ---------------- App ----------------
+
+export default function App() {
+  const [store, setStore] = useState(loadStore);
+  const { meds, settings } = store;
+  const [draft, setDraft] = useState<Med | null>(null);
+  const [editId, setEditId] = useState<string | null>(null);
+const [sortBy, setSortBy] = useState<"name" | "emptyDate" | "status">("emptyDate");
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORE_KEY, JSON.stringify(store));
+    } catch {
+      /* ignore */
+    }
+  }, [store]);
+const schedules = useMemo(
+  () =>
+    meds
+      .filter((med) => med.active)
+      .map(computeSchedule)
+      .sort((a, b) => {
+        if (sortBy === "name") {
+          return (a.med.name || "").localeCompare(b.med.name || "", "de");
+        }
+        if (sortBy === "status") {
+          const order: Record<string, number> = { sofort: 0, leer: 0, dringend: 1, bald: 2, ok: 3, unbekannt: 4 };
+          return (order[a.status] ?? 4) - (order[b.status] ?? 4);
+        }
+        if (!a.emptyDate) return 1;
+        if (!b.emptyDate) return -1;
+        return a.emptyDate.getTime() - b.emptyDate.getTime();
+      }),
+  [meds, sortBy]
+);
+
+  const inactive = useMemo(
+    () => meds.filter((med) => !med.active).map(computeSchedule),
+    [meds]
+  );
+
+  const counts = useMemo(() => {
+    const c = { sofort: 0, dringend: 0, bald: 0, ok: 0 };
+    for (const s of schedules) {
+      if (s.status === "leer" || s.status === "sofort" || s.status === "unbekannt") c.sofort++;
+      else if (s.status === "dringend") c.dringend++;
+      else if (s.status === "bald") c.bald++;
+      else c.ok++;
+    }
+    return c;
+  }, [schedules]);
+
+  const totalFees = useMemo(
+    () => schedules.reduce((sum, s) => sum + (calcFee(s.med, settings.haertefall) ?? 0), 0),
+    [schedules, settings.haertefall]
+  );
+
+  const save = (m: Med) => {
+    setStore((prev) => {
+      const exists = prev.meds.some((x) => x.id === m.id);
+      const next = exists ? prev.meds.map((x) => (x.id === m.id ? m : x)) : [...prev.meds, m];
+      return { ...prev, meds: next };
+    });
+    setDraft(null);
+    setEditId(null);
+  };
+
+  const remove = (id: string) => {
+    setStore((prev) => ({ ...prev, meds: prev.meds.filter((x) => x.id !== id) }));
+    setDraft(null);
+    setEditId(null);
+  };
+
+  /** Medikament abwählen (deaktivieren) bzw. wieder wählen – bei falscher Auswahl */
+  const toggleActive = (id: string) => {
+    setStore((prev) => ({
+      ...prev,
+      meds: prev.meds.map((x) => (x.id === id ? { ...x, active: !x.active } : x)),
+    }));
+    setEditId(null);
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-100 p-4 sm:p-8">
+      <div className="mx-auto max-w-7xl space-y-6">
+        {/* Kopf */}
+        <header className="flex flex-wrap items-center justify-between gap-4 rounded-xl bg-white p-5 shadow">
+          <div className="flex flex-wrap items-center gap-4">
+            <button
+              onClick={() => {
+                setDraft(defaultMed());
+                setEditId(null);
+              }}
+              className="rounded-lg bg-indigo-600 px-5 py-3 text-sm font-bold text-white shadow hover:bg-indigo-700"
+            >
+              + Medikament hinzufügen
+            </button>
+                        <button
+              onClick={() => {
+                const data = JSON.stringify({ meds, settings }, null, 2);
+                const blob = new Blob([data], { type: "application/json" });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement("a");
+                a.href = url;
+                a.download = `medikamente-${new Date().toISOString().slice(0, 10)}.json`;
+                a.click();
+                URL.revokeObjectURL(url);
+              }}
+              className="rounded-lg border border-emerald-300 bg-emerald-50 px-4 py-3 text-sm font-bold text-emerald-700 shadow hover:bg-emerald-100"
+              title="Alle Medikamente als JSON-Datei exportieren"
+            >
+              📤 Exportieren
+            </button>
+            <label
+              className="cursor-pointer rounded-lg border border-sky-300 bg-sky-50 px-4 py-3 text-sm font-bold text-sky-700 shadow hover:bg-sky-100"
+              title="JSON-Datei importieren (überschreibt aktuelle Daten)"
+            >
+              📥 Importieren
+              <input
+                type="file"
+                accept="application/json,.json"
+                className="hidden"
+                onChange={(e) => {
+                  const file = e.target.files?.[0];
+                  if (!file) return;
+                  const reader = new FileReader();
+                  reader.onload = (ev) => {
+                    try {
+                      const parsed = JSON.parse(String(ev.target?.result ?? ""));
+                      if (!parsed || !Array.isArray(parsed.meds)) {
+                        alert("Ungültige Datei: 'meds' fehlt.");
+                        return;
+                      }
+                      if (!confirm(`Import: ${parsed.meds.length} Medikamente ersetzen die aktuellen Daten. Fortfahren?`)) return;
+                      setStore({
+                        meds: parsed.meds.map((x: unknown) => normalizeMed(x as Partial<Med>)),
+                        settings: { haertefall: parsed.settings ? !!parsed.settings.haertefall : true },
+                      });
+                      alert(`Import erfolgreich: ${parsed.meds.length} Medikamente geladen.`);
+                    } catch {
+                      alert("Datei konnte nicht gelesen werden (kein gültiges JSON).");
+                    }
+                  };
+                  reader.readAsText(file);
+                  e.target.value = "";
+                }}
+              />
+            </label>
+            <div>
+              <h1 className="text-2xl font-bold text-slate-900">💊 Medikamenten-Planer</h1>
+              <p className="text-sm text-slate-500">
+                Verschreibung &amp; Apotheken-Bestellung rechtzeitig planen – Einnahme standardmäßig an jedem Wochentag (Mo–So).
+              </p>
+            </div>
+          </div>
+          <label className="flex items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-700">
+            <input
+              type="checkbox"
+              className="h-4 w-4 rounded border-slate-300 text-indigo-600"
+              checked={settings.haertefall}
+              onChange={(e) =>
+                setStore((prev) => ({ ...prev, settings: { haertefall: e.target.checked } }))
+              }
+            />
+            Härtefallstatus (Zuzahlungsbefreiung)
+          </label>
+        </header>
+
+        {/* Kurzübersicht */}
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+          <div className="rounded-xl border border-red-300 bg-red-50 p-4 text-red-800 shadow-sm">
+            <div className="text-3xl font-bold">{counts.sofort + counts.dringend}</div>
+            <div className="text-sm font-medium">sofort / dringend</div>
+          </div>
+          <div className="rounded-xl border border-amber-300 bg-amber-50 p-4 text-amber-800 shadow-sm">
+            <div className="text-3xl font-bold">{counts.bald}</div>
+            <div className="text-sm font-medium">bald fällig</div>
+          </div>
+          <div className="rounded-xl border border-green-300 bg-green-50 p-4 text-green-800 shadow-sm">
+            <div className="text-3xl font-bold">{counts.ok}</div>
+            <div className="text-sm font-medium">OK</div>
+          </div>
+          <div className="rounded-xl border border-indigo-200 bg-indigo-50 p-4 text-indigo-900 shadow-sm">
+            <div className="text-3xl font-bold">{fmtEuro(totalFees)}</div>
+            <div className="text-sm font-medium">anfallende Gebühren (insgesamt)</div>
+          </div>
+        </div>
+
+        {/* Neues Medikament */}
+        {draft && editId === null && <MedForm draft={draft} onSave={save} onCancel={() => setDraft(null)} />}
+
+        {/* Tabelle */}
+        <div className="overflow-x-auto rounded-xl bg-white p-2 shadow">
+        <table className="w-full min-w-[1150px] border-collapse text-sm">
+  <thead>
+    <tr className="border-b border-slate-200 text-left text-xs uppercase tracking-wide text-slate-500">
+      <th className="border border-slate-300 p-3">Medikament</th>
+      <th className="border border-slate-300 p-3">Status</th>
+      <th className="border border-slate-300 p-3">Packung leer am</th>
+      <th className="border border-slate-300 p-3">Verschreibung Arzt</th>
+      <th className="border border-slate-300 p-3">Bestellung Apotheke</th>
+      <th className="border border-slate-300 p-3">Verbrauch (tgl.)</th>
+      <th className="border border-slate-300 p-3">Abholung durch</th>
+      <th className="border border-slate-300 p-3">Bestand</th>
+      <th className="border border-slate-300 p-3">Packung (St.)</th>
+      <th className="border border-slate-300 p-3">Gebühr</th>
+    </tr>
+  </thead>
+  <tbody>
+    {schedules.length === 0 && (
+      <tr>
+        <td colSpan={10} className="p-8 text-center text-slate-400">
+          Noch kein Medikament erfasst – oben auf „+ Medikament" klicken.
+        </td>
+      </tr>
+    )}
+    {schedules.map((s) => {
+      const med = s.med;
+      const unit = unitOf(med);
+      const fee = calcFee(med, settings.haertefall);
+      const st = STATUS_STYLES[s.status];
+      const packs = med.packUnits > 0 ? med.currentStock / med.packUnits : 0;
+      const pct = Math.max(0, Math.min(100, packs * 100));
+      return (
+        <React.Fragment key={med.id}>
+          <tr className="border-b border-slate-100 align-top hover:bg-slate-50">
+            {/* 1. Medikament */}
+            <td className="border border-slate-300 p-3">
+              <div className="font-semibold text-slate-900">{med.name || "(ohne Namen)"}</div>
+              <div className="mt-0.5 flex flex-wrap items-center gap-1.5">
+                <span className={"rounded border px-1.5 py-0.5 text-xs font-semibold " + (med.retard ? "border-amber-300 bg-amber-50 text-amber-800" : "border-slate-200 bg-slate-50 text-slate-500")}>
+                  {med.retard ? "ret." : "nicht ret."}
+                </span>
+                {strengthText(med) && <span className="text-xs font-medium text-slate-600">{strengthText(med)}</span>}
+              </div>
+              {med.note && <div className="text-xs text-slate-400">{med.note}</div>}
+              {extrasText(med) && <div className="text-xs text-slate-400">Zusatz: {extrasText(med)}</div>}
+            </td>
+            {/* 2. Status */}
+            <td className="border border-slate-300 p-3">
+              <span className={"inline-block whitespace-nowrap rounded-full border px-2.5 py-1 text-xs font-semibold " + st.cls}>{st.label}</span>
+              <button type="button" onClick={() => toggleActive(med.id)} title="Medikament abwählen" className="mt-1 block text-xs text-slate-400 hover:text-red-600">✕ abwählen</button>
+            </td>
+            {/* 3. Packung leer am */}
+            <td className="border border-slate-300 p-3">
+              {s.emptyDate ? (<><div className="font-semibold text-slate-800">{fmt(s.emptyDate)}</div><div className="text-xs text-slate-500">in {s.daysToEmpty} Werktagen</div></>) : (<span className="text-xs text-slate-400">kein Verbrauch erfasst</span>)}
+            </td>
+            {/* 4. Verschreibung Arzt */}
+            <td className="border border-slate-300 p-3">
+              {s.doctorDate && (<><div className="font-semibold text-slate-800">{fmt(s.doctorDate)}</div><div className="text-xs text-slate-500">in {s.daysToDoctor} Werktagen</div></>)}
+            </td>
+            {/* 5. Bestellung Apotheke */}
+            <td className="border border-slate-300 p-3">
+              {s.pharmacyDate && <div className="font-semibold text-slate-800">{fmt(s.pharmacyDate)}</div>}
+            </td>
+            {/* 6. Verbrauch */}
+            <td className="border border-slate-300 p-3">
+              <div className="text-slate-700">{doseSummary(med)}</div>
+              <div className="text-xs text-slate-500">{s.weekly} {unit}/Woche ({med.countWeekend ? "Mo–So" : "Mo–Fr"})</div>
+            </td>
+            {/* 7. Abholung durch */}
+            <td className="border border-slate-300 p-3">{pickupList(med)}</td>
+            {/* 8. Bestand */}
+            <td className="w-44 p-3">
+              <div className="font-semibold text-slate-800">{med.currentStock} {unit}{" "}<span className="text-xs font-normal text-slate-500">/ {med.packsAtHome} Pck. ({med.packUnits * med.packsAtHome} {unit})</span></div>
+              <div className="mt-1 h-2 w-full overflow-hidden rounded-full bg-slate-200"><div className={"h-full rounded-full " + (pct > 50 ? "bg-green-500" : pct > 20 ? "bg-amber-500" : "bg-red-500")} style={{ width: `${pct}%` }} /></div>
+              <div className="mt-0.5 text-xs text-slate-400">{packs.toLocaleString("de-DE", { maximumFractionDigits: 1 })} Packungen</div>
+            </td>
+            {/* 9. Packung */}
+            <td className="border border-slate-300 p-3">
+              <div className="font-semibold text-slate-800">{med.packLabel}</div>
+              <div className="text-xs text-slate-500">{med.packUnits} {unit} / Packung</div>
+            </td>
+            {/* 10. Gebühr */}
+            <td className="border border-slate-300 p-3">
+              {fee === null ? (<span className="text-xs text-slate-400">Preis unbekannt</span>) : (<div><div className="font-semibold text-slate-800">{fmtEuro(fee)}</div>{settings.haertefall && !med.feeDespiteExemption && fee === 0 && (<div className="text-xs text-green-600">Härtefall: befreit</div>)}{settings.haertefall && med.feeDespiteExemption && (<div className="text-xs text-amber-600">trotz Härtefall fällig</div>)}{!settings.haertefall && (<div className="text-xs text-slate-400">10 %, min. 5 / max. 10 €</div>)}</div>)}
+            </td>
+          </tr>
+          {editId === med.id && (
+            <tr>
+              <td colSpan={10} className="p-3">
+                <MedForm draft={med} onSave={save} onCancel={() => setEditId(null)} onDelete={() => remove(med.id)} />
+              </td>
+            </tr>
+          )}
+        </React.Fragment>
+      );
+    })}
+  </tbody>
+</table>
+        </div>
+
+        {/* Aktionen */}
+        {schedules.length > 0 && (
+          <div className="flex flex-wrap gap-2">
+            {schedules.map((s) => (
+              <button
+                key={s.med.id}
+                onClick={() => {
+                  setEditId(s.med.id === editId ? null : s.med.id);
+                  setDraft(null);
+                }}
+                className={
+                  "rounded-md border px-3 py-1.5 text-xs font-semibold shadow-sm " +
+                  (s.med.id === editId
+                    ? "border-indigo-600 bg-indigo-600 text-white"
+                    : "border-slate-300 bg-white text-slate-700 hover:bg-slate-50")
+                }
+              >
+                ✏️ {s.med.name || "(ohne Namen)"} bearbeiten
+              </button>
+            ))}
+          </div>
+        )}
+
+        {/* Abgewählte (inaktive) Medikamente */}
+        {inactive.length > 0 && (
+          <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+            <h3 className="mb-2 text-sm font-semibold text-slate-600">
+              ✕ Abgewählte Medikamente ({inactive.length}) – nicht in der Planung berücksichtigt
+            </h3>
+            {inactive.map((s) => (
+              <div
+                key={s.med.id}
+                className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-100 py-2 text-sm"
+              >
+                <span className="font-semibold text-slate-400 line-through">
+                  {s.med.name || "(ohne Namen)"}
+                </span>
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    onClick={() => toggleActive(s.med.id)}
+                    className="rounded-md border border-indigo-300 bg-indigo-50 px-3 py-1 text-xs font-semibold text-indigo-700 hover:bg-indigo-100"
+                  >
+                    ✓ wieder wählen
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => remove(s.med.id)}
+                    className="rounded-md border border-red-300 bg-white px-3 py-1 text-xs font-semibold text-red-700 hover:bg-red-50"
+                  >
+                    🗑 endgültig löschen
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Erläuterung */}
+        <footer className="rounded-xl border border-slate-200 bg-white p-4 text-xs leading-relaxed text-slate-500 shadow-sm">
+          <p className="mb-1 font-semibold text-slate-600">Hinweise zur Berechnung:</p>
+          <p>
+            • <b>Leer-Datum:</b> Der aktuelle Bestand wird Tag für Tag abgezogen – standardmäßig an
+            allen sieben Wochentagen (Mo–So), sodass die Packung auch am Wochenende läuft. „Packung
+            leer am“ ist der Tag, an dem die Packung beim normalen, aktuellen Verbrauch aufgebraucht
+            ist. Wer ein Medikament nur Mo–Fr nimmt, kann das Wochenende pro Medikament abwählen
+            („Nur Mo–Fr“).
+          </p>
+          <p>
+            • <b>Späteste Verschreibung/Bestellung:</b> Vom Leer-Datum wird der eingestellte Vorlauf in
+            Werktagen zurückgerechnet – der letzte Werktag, an dem der Arztbesuch bzw. die
+            Apotheken-Bestellung noch rechtzeitig ist.
+          </p>
+          <p>
+            • <b>Gebühren:</b> Gesetzliche Zuzahlung = 10 % des Abgabepreises, mindestens 5 €, höchstens
+            10 € pro Packung. Mit aktiver Zuzahlungsbefreiung (Härtefallstatus) entfällt sie für
+            Arzneimittel; einzelne Medikamente lassen sich als „trotz Härtefall zuzahlungspflichtig“
+            markieren oder mit manuellem Betrag hinterlegen.
+          </p>
+          <p>
+            • <b>Abwählen:</b> Falsch ausgewählte Medikamente lassen sich per „✕ abwählen“
+            deaktivieren – sie verschwinden aus Übersicht, Berechnung und Gebühren-Summe, bleiben
+            aber gespeichert und können jederzeit wieder gewählt oder endgültig gelöscht werden.
+          </p>
+          <p className="mt-1">
+            Alle Daten werden nur lokal im Browser gespeichert. Angaben ohne Gewähr – berechnete Fristen
+            bitte mit Arzt und Apotheke abstimmen.
+          </p>
+        </footer>
+      </div>
+    </div>
+  );
+}
