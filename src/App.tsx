@@ -84,8 +84,7 @@ function weeklyDose(med: Med): number {
   }
   return sum;
 }
-
-function workdaysUntil(target: Date): number {
+function workdaysUntil(target: Date, state: string): number {
   const today = parseISO(todayISO());
   const t = new Date(target);
   today.setHours(0, 0, 0, 0);
@@ -96,7 +95,7 @@ function workdaysUntil(target: Date): number {
     while (d > t) {
       d.setDate(d.getDate() - 1);
       const wd = d.getDay();
-      if (wd !== 0 && wd !== 6) n--;
+      if (isWorkday(d, state)) n--;
     }
     return n;
   }
@@ -104,22 +103,27 @@ function workdaysUntil(target: Date): number {
   while (d < t) {
     d.setDate(d.getDate() + 1);
     const wd = d.getDay();
-    if (wd !== 0 && wd !== 6) n++;
+    if (isWorkday(d, state)) n++;
   }
   return n;
 }
 
-function subtractWorkdays(from: Date, n: number): Date {
+function subtractWorkdays(from: Date, n: number, state: string): Date {
   const d = new Date(from);
   let left = Math.max(0, Math.round(n));
   while (left > 0) {
     d.setDate(d.getDate() - 1);
     const wd = d.getDay();
-    if (wd !== 0 && wd !== 6) left--;
+    if (isWorkday(d, state)) left--;
   }
   return d;
 }
-
+function isWorkday(d: Date, state: string): boolean {
+  const wd = d.getDay();
+  if (wd === 0 || wd === 6) return false;
+  const iso = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  return !isFeiertag(iso, state);
+}
 interface Schedule {
   med: Med;
   emptyDate: Date | null;
@@ -131,7 +135,7 @@ interface Schedule {
   status: "leer" | "sofort" | "dringend" | "bald" | "ok" | "unbekannt";
 }
 
-function computeSchedule(med: Med): Schedule {
+function computeSchedule(med: Med, state: string): Schedule {
   const weekly = weeklyDose(med);
   const start = parseISO(med.stockAsOf);
   let emptyDate: Date | null = null;
@@ -158,15 +162,15 @@ function computeSchedule(med: Med): Schedule {
     }
   }
 
-  const doctorDate = emptyDate ? subtractWorkdays(emptyDate, med.doctorLead) : null;
-  const pharmacyDate = emptyDate ? subtractWorkdays(emptyDate, med.pharmacyLead) : null;
+  const doctorDate = emptyDate ? subtractWorkdays(emptyDate, med.doctorLead, state) : null;
+  const pharmacyDate = emptyDate ? subtractWorkdays(emptyDate, med.pharmacyLead, state) : null;
 
   let status: Schedule["status"] = "unbekannt";
   let daysToEmpty = 0;
   let daysToDoctor = 0;
   if (emptyDate) {
-    daysToEmpty = workdaysUntil(emptyDate);
-    daysToDoctor = doctorDate ? workdaysUntil(doctorDate) : 0;
+    daysToEmpty = workdaysUntil(emptyDate, state);
+    daysToDoctor = doctorDate ? workdaysUntil(doctorDate, state) : 0;
     if (med.currentStock <= 0) status = "leer";
     else if (daysToEmpty <= 0) status = "sofort";
     else if (daysToDoctor <= 0) status = "sofort";
@@ -690,7 +694,7 @@ export default function App() {
     () =>
       meds
         .filter((med) => med.active)
-        .map(computeSchedule)
+        .map((med) => computeSchedule(med, settings.state))
         .sort((a, b) => {
           if (sortBy === "name") return (a.med.name || "").localeCompare(b.med.name || "", "de");
           if (sortBy === "status") {
@@ -701,10 +705,13 @@ export default function App() {
           if (!b.emptyDate) return -1;
           return a.emptyDate.getTime() - b.emptyDate.getTime();
         }),
-    [meds, sortBy]
+    [meds, sortBy, settings.state]
   );
 
-  const inactive = useMemo(() => meds.filter((med) => !med.active).map(computeSchedule), [meds]);
+  const inactive = useMemo(
+  () => meds.filter((med) => !med.active).map((med) => computeSchedule(med, settings.state)),
+  [meds, settings.state]
+);
 
   const counts = useMemo(() => {
     const c = { sofort: 0, dringend: 0, bald: 0, ok: 0 };
