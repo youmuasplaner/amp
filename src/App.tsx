@@ -94,35 +94,23 @@ function workdaysUntil(target: Date, state: string): number {
     let d = new Date(today);
     while (d > t) {
       d.setDate(d.getDate() - 1);
-      const wd = d.getDay();
-      if (isWorkday(d, state)) n--;
+        if (isWorkday(d, state)) n--;
     }
     return n;
   }
   let d = new Date(today);
   while (d < t) {
     d.setDate(d.getDate() + 1);
-    const wd = d.getDay();
     if (isWorkday(d, state)) n++;
   }
   return n;
 }
 
-function subtractWorkdays(from: Date, n: number, state: string): Date {
-  const d = new Date(from);
-  let left = Math.max(0, Math.round(n));
-  while (left > 0) {
-    d.setDate(d.getDate() - 1);
-    const wd = d.getDay();
-    if (isWorkday(d, state)) left--;
-  }
-  return d;
-}
 function isWorkday(d: Date, state: string): boolean {
   const wd = d.getDay();
   if (wd === 0 || wd === 6) return false;
   const iso = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-  return !isFeiertag(iso, state);
+  return !isFeiertag(iso as `${number}-${string}-${string}`, state as never);
 }
 interface Schedule {
   med: Med;
@@ -134,7 +122,15 @@ interface Schedule {
   daysToDoctor: number;
   status: "leer" | "sofort" | "dringend" | "bald" | "ok" | "unbekannt";
 }
-
+function subtractWorkdays(from: Date, n: number, state: string): Date {
+  const d = new Date(from);
+  let left = Math.max(0, Math.round(n));
+  while (left > 0) {
+    d.setDate(d.getDate() - 1);
+    if (isWorkday(d, state)) left--;
+  }
+  return d;
+}
 function computeSchedule(med: Med, state: string): Schedule {
   const weekly = weeklyDose(med);
   const start = parseISO(med.stockAsOf);
@@ -680,8 +676,7 @@ export default function App() {
   const { meds, settings } = store;
   const [draft, setDraft] = useState<Med | null>(null);
   const [editId, setEditId] = useState<string | null>(null);
-  const [sortBy, setSortBy] = useState<"name" | "emptyDate" | "status">("emptyDate");
-
+  const [sortBy] = useState<"name" | "emptyDate" | "status">("emptyDate");
   useEffect(() => {
     try {
       localStorage.setItem(STORE_KEY, JSON.stringify(store));
