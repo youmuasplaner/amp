@@ -471,7 +471,7 @@ function MedForm({ draft, onSave, onCancel, onDelete }: {
         </Field>
         <Field label={`Aktueller Bestand (${unit})`} hint="Jetzt tatsächlich vorrätige Menge">
           <NumInput value={m.currentStock} onChange={(v) => upd("currentStock", v)}
-            step={unit === "ml" ? 0.1 : 0.5} suffix={unit} />
+            step={unit === "ml" ? 0.1 : 0.25} suffix={unit} />
         </Field>
         <Field label="Bestand gezählt am">
           <input type="date" className={inputCls} value={m.stockAsOf}
@@ -598,7 +598,7 @@ function MedForm({ draft, onSave, onCancel, onDelete }: {
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             <Field label={`Einnahme pro Tag (${unit})`}
               hint="Gilt automatisch für alle zugehörigen Wochentage – hier genügt eine einzige Eingabe">
-              <NumInput value={m.doses.mo} step={unit === "ml" ? 0.1 : 0.5} suffix={unit}
+              <NumInput value={m.doses.mo} step={unit === "ml" ? 0.1 : 0.25} suffix={unit}
                 onChange={(v) =>
                   setM((prev) => ({
                     ...prev,
@@ -618,7 +618,7 @@ function MedForm({ draft, onSave, onCancel, onDelete }: {
                     (inactive ? "text-slate-300" : "text-slate-600")}>
                     {WD_LABELS[k]}
                   </span>
-                  <input type="number" step={unit === "ml" ? 0.1 : 0.5} min={0}
+                  <input type="number" step={unit === "ml" ? 0.1 : 0.25} min={0}
                     disabled={inactive}
                     value={Number.isNaN(m.doses[k]) ? "" : m.doses[k]}
                     onChange={(e) => updDose(k, e.target.value === "" ? 0 : parseFloat(e.target.value))}
@@ -651,7 +651,34 @@ function MedForm({ draft, onSave, onCancel, onDelete }: {
       </div>
 
       <div className="mt-4 flex flex-wrap gap-2">
-        <button onClick={() => onSave(m)}
+        <button
+          onClick={() => {
+            if (m.packUnits <= 0) {
+              alert("Inhalt pro Packung muss größer als 0 sein.");
+              return;
+            }
+            if (m.currentStock < 0) {
+              alert("Der aktuelle Bestand darf nicht negativ sein.");
+              return;
+            }
+            if (m.price < 0) {
+              alert("Der Abgabepreis darf nicht negativ sein.");
+              return;
+            }
+            if (m.doctorLead < 0 || m.pharmacyLead < 0) {
+              alert("Vorlaufzeiten dürfen nicht negativ sein.");
+              return;
+            }
+            if (m.packsAtHome < 0) {
+              alert("Der Grundbestand darf nicht negativ sein.");
+              return;
+            }
+            if (m.stockAsOf > todayISO()) {
+              alert("Das Zähl-Datum darf nicht in der Zukunft liegen.");
+              return;
+            }
+            onSave(m);
+          }}
           className="rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow hover:bg-indigo-700">
           Speichern
         </button>
@@ -701,7 +728,7 @@ export default function App() {
   const counts = useMemo(() => {
     const c = { sofort: 0, dringend: 0, bald: 0, ok: 0 };
     for (const s of schedules) {
-      if (s.status === "leer" || s.status === "sofort" || s.status === "unbekannt") c.sofort++;
+      if (s.status === "leer" || s.status === "sofort") c.sofort++;
       else if (s.status === "dringend") c.dringend++;
       else if (s.status === "bald") c.bald++;
       else c.ok++;
@@ -713,7 +740,10 @@ export default function App() {
     () => schedules.reduce((sum, s) => sum + (calcFee(s.med, settings.haertefall) ?? 0), 0),
     [schedules, settings.haertefall]
   );
-
+  const unknownFeeCount = useMemo(
+    () => schedules.filter((s) => calcFee(s.med, settings.haertefall) === null).length,
+    [schedules, settings.haertefall]
+  );
   const save = (m: Med) => {
     setStore((prev) => {
       const exists = prev.meds.some((x) => x.id === m.id);
@@ -952,7 +982,7 @@ export default function App() {
 
         {/* Aktionen */}
         {schedules.length > 0 && (
-          <div className="flex flex-col items-start gap-1">
+          <div className="flex flex-col gap-1">
             {schedules.map((s) => (
               <button
                 key={s.med.id}
@@ -1084,7 +1114,14 @@ export default function App() {
           </div>
           <div className="flex items-center justify-between border-t border-slate-100 pt-3 text-sm">
             <span className="text-slate-500">Anfallende Gebühren (insgesamt)</span>
-            <span className="font-semibold text-slate-800">{fmtEuro(totalFees)}</span>
+            <span className="flex items-center gap-2">
+              <span className="font-semibold text-slate-800">{fmtEuro(totalFees)}</span>
+              {unknownFeeCount > 0 && (
+                <span className="text-xs text-amber-600">
+                  ({unknownFeeCount} ohne Preis)
+                </span>
+              )}
+            </span>
           </div>
         </div>
       </div>
