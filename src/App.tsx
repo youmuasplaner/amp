@@ -779,6 +779,16 @@ export default function App() {
           <div className="flex items-center gap-2">
             <button
               onClick={() => {
+                setDraft(defaultMed());
+                setEditId(null);
+              }}
+              title="Neues Medikament hinzufügen"
+              className="rounded-md bg-indigo-600 px-3 py-2 text-sm font-semibold text-white hover:bg-indigo-700"
+            >
+              + Medikament
+            </button>
+            <button
+              onClick={() => {
                 const data = JSON.stringify({ meds, settings }, null, 2);
                 const blob = new Blob([data], { type: "application/json" });
                 const url = URL.createObjectURL(blob);
@@ -833,16 +843,7 @@ export default function App() {
                 }}
               />
             </label>
-            <button
-              onClick={() => {
-                setDraft(defaultMed());
-                setEditId(null);
-              }}
-              title="Neues Medikament hinzufügen"
-              className="rounded-md bg-indigo-600 px-3 py-2 text-sm font-semibold text-white hover:bg-indigo-700"
-            >
-              + Medikament
-            </button>
+           
           </div>
         </header>
 

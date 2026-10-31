@@ -6540,7 +6540,7 @@ async function onRequestPost(context2) {
 }
 __name(onRequestPost, "onRequestPost");
 
-// ../.wrangler/tmp/pages-7vU4ws/functionsRoutes-0.2759041927784127.mjs
+// ../.wrangler/tmp/pages-ZI3TNn/functionsRoutes-0.8034230172892596.mjs
 var routes = [
   {
     routePath: "/api/medikamente",
