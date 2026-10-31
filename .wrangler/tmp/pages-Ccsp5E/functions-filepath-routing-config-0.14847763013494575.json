@@ -1,0 +1,21 @@
+{
+  "routes": [
+    {
+      "routePath": "/api/medikamente",
+      "mountPath": "/api",
+      "method": "GET",
+      "module": [
+        "api/medikamente.js:onRequestGet"
+      ]
+    },
+    {
+      "routePath": "/api/medikamente",
+      "mountPath": "/api",
+      "method": "POST",
+      "module": [
+        "api/medikamente.js:onRequestPost"
+      ]
+    }
+  ],
+  "baseURL": "/"
+}

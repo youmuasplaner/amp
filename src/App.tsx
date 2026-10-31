@@ -676,7 +676,6 @@ export default function App() {
   const { meds, settings } = store;
   const [draft, setDraft] = useState<Med | null>(null);
   const [editId, setEditId] = useState<string | null>(null);
-  const [sortBy] = useState<"name" | "emptyDate" | "status">("emptyDate");
   useEffect(() => {
     try {
       localStorage.setItem(STORE_KEY, JSON.stringify(store));
@@ -685,22 +684,13 @@ export default function App() {
     }
   }, [store]);
 
-  const schedules = useMemo(
+    const schedules = useMemo(
     () =>
       meds
         .filter((med) => med.active)
         .map((med) => computeSchedule(med, settings.state))
-        .sort((a, b) => {
-          if (sortBy === "name") return (a.med.name || "").localeCompare(b.med.name || "", "de");
-          if (sortBy === "status") {
-            const order: Record<string, number> = { sofort: 0, leer: 0, dringend: 1, bald: 2, ok: 3, unbekannt: 4 };
-            return (order[a.status] ?? 4) - (order[b.status] ?? 4);
-          }
-          if (!a.emptyDate) return 1;
-          if (!b.emptyDate) return -1;
-          return a.emptyDate.getTime() - b.emptyDate.getTime();
-        }),
-    [meds, sortBy, settings.state]
+        .sort((a, b) => (a.med.name || "").localeCompare(b.med.name || "", "de")),
+    [meds, settings.state]
   );
 
   const inactive = useMemo(
@@ -962,7 +952,7 @@ export default function App() {
 
         {/* Aktionen */}
         {schedules.length > 0 && (
-          <div className="flex flex-wrap gap-2">
+          <div className="flex flex-col items-start gap-1">
             {schedules.map((s) => (
               <button
                 key={s.med.id}
