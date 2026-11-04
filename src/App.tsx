@@ -39,11 +39,25 @@ interface Med {
   feeOverride: number | null;
   note: string;
   active: boolean;
+  packages: Package[];
+  asNeeded: boolean;
+}
+
+interface Package {
+  id: string;
+  date: string;
+  units: number;
+  price: number;
+  insurancePays: number | null;
+  actuallyPaid: number | null;
+  feeOverride: number | null;
+  usedUp: boolean;
 }
 
 interface Settings {
   haertefall: boolean;
   state: string;
+  insurance: "statutory" | "private";
 }
 
 const WD_KEYS: (keyof Doses)[] = ["so", "mo", "di", "mi", "do", "fr", "sa"];
@@ -131,15 +145,23 @@ function subtractWorkdays(from: Date, n: number, state: string): Date {
   }
   return d;
 }
+function activeStock(med: Med): { units: number; start: Date | null } {
+  const active = med.packages
+    .filter((p) => !p.usedUp && p.units > 0)
+    .sort((a, b) => a.date.localeCompare(b.date));
+  if (active.length === 0) return { units: 0, start: null };
+  const units = active.reduce((sum, p) => sum + p.units, 0);
+  return { units, start: parseISO(active[0].date) };
+}
 function computeSchedule(med: Med, state: string): Schedule {
   const weekly = weeklyDose(med);
-  const start = parseISO(med.stockAsOf);
+  const { units: stockNow, start } = activeStock(med);
   let emptyDate: Date | null = null;
 
-  if (med.currentStock <= 0) {
-    emptyDate = start;
+  if (!start || stockNow <= 0) {
+    emptyDate = start ?? parseISO(todayISO());
   } else if (weekly > 0) {
-    let stock = med.currentStock;
+    let stock = stockNow;
     const d = new Date(start);
     for (let i = 0; i < 2000; i++) {
       const dose = doseFor(med, d);
@@ -167,7 +189,7 @@ function computeSchedule(med: Med, state: string): Schedule {
   if (emptyDate) {
     daysToEmpty = workdaysUntil(emptyDate, state);
     daysToDoctor = doctorDate ? workdaysUntil(doctorDate, state) : 0;
-    if (med.currentStock <= 0) status = "leer";
+    if (stockNow <= 0) status = "leer";
     else if (daysToEmpty <= 0) status = "sofort";
     else if (daysToDoctor <= 0) status = "sofort";
     else if (daysToDoctor <= 2) status = "dringend";
@@ -176,14 +198,22 @@ function computeSchedule(med: Med, state: string): Schedule {
   }
   return { med, emptyDate, doctorDate, pharmacyDate, weekly, daysToEmpty, daysToDoctor, status };
 }
-
-function calcFee(med: Med, haertefall: boolean): number | null {
-  if (med.feeOverride !== null && !Number.isNaN(med.feeOverride)) return med.feeOverride;
-  if (haertefall && !med.feeDespiteExemption) return 0;
-  if (med.price > 0) return Math.min(10, Math.max(5, med.price * 0.1));
-  return null;
+function calcPackageFee(
+  pkg: Package,
+  _med: Med,
+  _settings: Settings
+): number {
+  if (typeof pkg.actuallyPaid === "number" && !Number.isNaN(pkg.actuallyPaid)) {
+    return pkg.actuallyPaid;
+  }
+  if (typeof pkg.feeOverride === "number" && !Number.isNaN(pkg.feeOverride)) {
+    return pkg.feeOverride;
+  }
+  if (typeof pkg.insurancePays === "number" && !Number.isNaN(pkg.insurancePays)) {
+    return Math.max(0, pkg.price - pkg.insurancePays);
+  }
+  return 0;
 }
-
 function newId(): string {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 }
@@ -217,6 +247,8 @@ function defaultMed(): Med {
     feeOverride: null,
     note: "",
     active: true,
+    packages: [],
+    asNeeded: false,
   };
 }
 
@@ -253,6 +285,21 @@ function normalizeMed(raw: Partial<Med>): Med {
     m.pickupSelf = raw.pickupSelf === undefined ? !old : !!raw.pickupSelf;
   }
   m.active = raw.active === undefined ? true : !!raw.active;
+  if (!Array.isArray(raw.packages)) {
+    m.packages = m.currentStock > 0 && m.stockAsOf
+      ? [{
+          id: newId(),
+          date: m.stockAsOf,
+          units: m.packUnits,
+          price: m.price,
+          insurancePays: null,
+          actuallyPaid: null,
+          feeOverride: m.feeOverride,
+          usedUp: false,
+        }]
+      : [];
+  }
+  m.asNeeded = raw.asNeeded === undefined ? false : !!raw.asNeeded;
   if (raw.uniformDose === undefined) {
     const counted = WD_ORDER.filter((k) => m.countWeekend || (k !== "sa" && k !== "so"));
     const vals = counted.map((k) => m.doses[k] ?? 0);
@@ -278,17 +325,18 @@ function loadStore(): { meds: Med[]; settings: Settings } {
       if (parsed && Array.isArray(parsed.meds)) {
         return {
           meds: parsed.meds.map((x: unknown) => normalizeMed(x as Partial<Med>)),
-          settings: {
-            haertefall: parsed.settings ? !!parsed.settings.haertefall : true,
-            state: parsed.settings?.state || "BY",
-          },
+                                  settings: {
+                          haertefall: parsed.settings ? !!parsed.settings.haertefall : true,
+                          state: parsed.settings?.state || "BY",
+                          insurance: parsed.settings?.insurance === "private" ? "private" : "statutory",
+                        },
         };
       }
     }
   } catch {
     /* ignore */
   }
-  return { meds: seedMeds(), settings: { haertefall: true, state: "BY" } };
+  return { meds: seedMeds(), settings: { haertefall: true, state: "BY", insurance: "statutory" } };
 }// ---------------- UI-Bausteine ----------------
 
 const STATUS_STYLES: Record<Schedule["status"], { label: string; cls: string }> = {
@@ -313,7 +361,7 @@ function Field({ label, children, hint }: { label: string; children: React.React
 const inputCls =
   "w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 shadow-sm focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-200";
 
-function NumInput({ value, onChange, step = 1, min = 0, suffix }: {
+ function NumInput({ value, onChange, step = 1, min = 0, suffix }: {
   value: number;
   onChange: (v: number) => void;
   step?: number;
@@ -328,6 +376,11 @@ function NumInput({ value, onChange, step = 1, min = 0, suffix }: {
         value={Number.isNaN(value) ? "" : value}
         step={step}
         min={min}
+        onFocus={(e) => {
+          if (e.target.value === "0") {
+            e.target.value = "";
+          }
+        }}
         onChange={(e) => onChange(e.target.value === "" ? 0 : parseFloat(e.target.value))}
       />
       {suffix && (
@@ -435,7 +488,7 @@ function MedForm({ draft, onSave, onCancel, onDelete }: {
         <Field label="Retard?" hint="retardiert (ret.) = verzögerte Wirkstofffreisetzung">
           <select className={inputCls} value={m.retard ? "ret" : "nicht"}
             onChange={(e) => upd("retard", e.target.value === "ret")}>
-            <option value="nicht">nicht ret.</option>
+            <option value="nicht">unret.</option>
             <option value="ret">ret.</option>
           </select>
         </Field>
@@ -634,6 +687,103 @@ function MedForm({ draft, onSave, onCancel, onDelete }: {
         </p>
       </div>
 
+      <div className="mt-4 rounded-lg border border-slate-200 bg-white p-3">
+        <div className="mb-2 flex items-center justify-between">
+          <span className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+            Packungen
+          </span>
+          <button
+            type="button"
+            onClick={() =>
+              setM((prev) => ({
+                ...prev,
+                packages: [
+                  ...prev.packages,
+                  {
+                    id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+                    date: todayISO(),
+                    units: prev.packUnits,
+                    price: 0,
+                    insurancePays: null,
+                    actuallyPaid: null,
+                    feeOverride: null,
+                    usedUp: false,
+                  },
+                ],
+              }))
+            }
+            className="rounded-md bg-indigo-600 px-2.5 py-1 text-xs font-semibold text-white hover:bg-indigo-700"
+          >
+            + Packung hinzufügen
+          </button>
+        </div>
+        {m.packages.length === 0 && (
+          <p className="text-xs text-slate-400">Noch keine Packung erfasst.</p>
+        )}
+        {m.packages.map((p, idx) => (
+          <div key={p.id} className="mt-2 grid grid-cols-2 gap-2 rounded-md border border-slate-100 p-2 sm:grid-cols-6">
+            <label className="text-xs">
+              <span className="block text-slate-500">Datum</span>
+              <input type="date" className={inputCls}
+                value={p.date}
+                onChange={(e) => setM((prev) => ({
+                  ...prev,
+                  packages: prev.packages.map((x, i) => i === idx ? { ...x, date: e.target.value } : x),
+                }))} />
+            </label>
+            <label className="text-xs">
+              <span className="block text-slate-500">Einheiten</span>
+              <input type="number" className={inputCls} step={0.25}
+                value={p.units}
+                onChange={(e) => setM((prev) => ({
+                  ...prev,
+                  packages: prev.packages.map((x, i) => i === idx ? { ...x, units: parseFloat(e.target.value) || 0 } : x),
+                }))} />
+            </label>
+            <label className="text-xs">
+              <span className="block text-slate-500">Gezahlt (€)</span>
+              <input type="number" className={inputCls} step={0.01}
+                value={p.actuallyPaid === null ? "" : p.actuallyPaid}
+                placeholder="—"
+                onChange={(e) => setM((prev) => ({
+                  ...prev,
+                  packages: prev.packages.map((x, i) => i === idx ? { ...x, actuallyPaid: e.target.value === "" ? null : parseFloat(e.target.value) } : x),
+                }))} />
+            </label>
+            <label className="text-xs">
+              <span className="block text-slate-500">Abgabepreis (€)</span>
+              <input type="number" className={inputCls} step={0.01}
+                value={p.price}
+                onChange={(e) => setM((prev) => ({
+                  ...prev,
+                  packages: prev.packages.map((x, i) => i === idx ? { ...x, price: parseFloat(e.target.value) || 0 } : x),
+                }))} />
+            </label>
+            <label className="text-xs">
+              <span className="block text-slate-500">Kasse (€)</span>
+              <input type="number" className={inputCls} step={0.01}
+                value={p.insurancePays === null ? "" : p.insurancePays}
+                placeholder="—"
+                onChange={(e) => setM((prev) => ({
+                  ...prev,
+                  packages: prev.packages.map((x, i) => i === idx ? { ...x, insurancePays: e.target.value === "" ? null : parseFloat(e.target.value) } : x),
+                }))} />
+            </label>
+            <div className="flex items-end">
+              <button
+                type="button"
+                onClick={() => setM((prev) => ({
+                  ...prev,
+                  packages: prev.packages.filter((_, i) => i !== idx),
+                }))}
+                className="rounded-md border border-red-300 bg-white px-2 py-1 text-xs font-semibold text-red-700 hover:bg-red-50"
+              >
+                ✕
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
       <div className="mt-3 flex flex-wrap items-center gap-4">
         <label className="flex items-center gap-2 text-sm text-slate-700">
           <input type="checkbox" className="h-4 w-4 rounded border-slate-300 text-indigo-600"
@@ -737,12 +887,25 @@ export default function App() {
   }, [schedules]);
 
   const totalFees = useMemo(
-    () => schedules.reduce((sum, s) => sum + (calcFee(s.med, settings.haertefall) ?? 0), 0),
-    [schedules, settings.haertefall]
+    () =>
+      schedules.reduce(
+        (sum, s) =>
+          sum +
+          s.med.packages
+            .filter((p) => !p.usedUp)
+            .reduce((pSum, p) => pSum + calcPackageFee(p, s.med, settings), 0),
+        0
+      ),
+    [schedules, settings]
   );
   const unknownFeeCount = useMemo(
-    () => schedules.filter((s) => calcFee(s.med, settings.haertefall) === null).length,
-    [schedules, settings.haertefall]
+    () =>
+      schedules.filter((s) =>
+        s.med.packages
+          .filter((p) => !p.usedUp)
+          .some((p) => calcPackageFee(p, s.med, settings) === 0 && p.price <= 0)
+      ).length,
+    [schedules, settings]
   );
   const save = (m: Med) => {
     setStore((prev) => {
@@ -851,6 +1014,7 @@ export default function App() {
                         settings: {
                           haertefall: parsed.settings ? !!parsed.settings.haertefall : true,
                           state: parsed.settings?.state || "BY",
+                          insurance: parsed.settings?.insurance === "private" ? "private" : "statutory",
                         },
                       });
                       alert(`Import erfolgreich: ${parsed.meds.length} Medikamente geladen.`);
@@ -917,7 +1081,9 @@ export default function App() {
               {schedules.map((s) => {
                 const med = s.med;
                 const unit = unitOf(med);
-                const fee = calcFee(med, settings.haertefall);
+                const fee = med.packages
+                  .filter((p) => !p.usedUp)
+                  .reduce((sum, p) => sum + calcPackageFee(p, med, settings), 0);
                 const st = STATUS_STYLES[s.status];
                 const packs = med.packUnits > 0 ? med.currentStock / med.packUnits : 0;
                 const pct = Math.max(0, Math.min(100, packs * 100));
@@ -928,7 +1094,7 @@ export default function App() {
                         <div className="font-semibold text-slate-900">{med.name || "(ohne Namen)"}</div>
                         <div className="mt-0.5 flex flex-wrap items-center gap-1.5">
                           <span className={"rounded border px-1.5 py-0.5 text-xs font-semibold " + (med.retard ? "border-amber-300 bg-amber-50 text-amber-800" : "border-slate-200 bg-slate-50 text-slate-500")}>
-                            {med.retard ? "ret." : "nicht ret."}
+                            {med.retard ? "ret." : "unret."}
                           </span>
                           {strengthText(med) && <span className="text-xs font-medium text-slate-600">{strengthText(med)}</span>}
                         </div>
@@ -962,8 +1128,13 @@ export default function App() {
                         <div className="font-semibold text-slate-800">{med.packLabel}</div>
                         <div className="text-xs text-slate-500">{med.packUnits} {unit} / Packung</div>
                       </td>
-                      <td className="border border-slate-300 p-3">
-                        {fee === null ? (<span className="text-xs text-slate-400">Preis unbekannt</span>) : (<div><div className="font-semibold text-slate-800">{fmtEuro(fee)}</div>{settings.haertefall && !med.feeDespiteExemption && fee === 0 && (<div className="text-xs text-green-600">Härtefall: befreit</div>)}{settings.haertefall && med.feeDespiteExemption && (<div className="text-xs text-amber-600">trotz Härtefall fällig</div>)}{!settings.haertefall && (<div className="text-xs text-slate-400">10 %, min. 5 / max. 10 €</div>)}</div>)}
+                                            <td className="border border-slate-300 p-3">
+                        <div>
+                          <div className="font-semibold text-slate-800">{fmtEuro(fee)}</div>
+                          {settings.haertefall && med.feeDespiteExemption && (
+                            <div className="text-xs text-amber-600">trotz Härtefall Zahlung fällig</div>
+                          )}
+                        </div>
                       </td>
                     </tr>
                     {editId === med.id && (
@@ -982,7 +1153,7 @@ export default function App() {
 
         {/* Aktionen */}
         {schedules.length > 0 && (
-          <div className="flex flex-col gap-1">
+          <div className="flex flex-col items-start gap-1">
             {schedules.map((s) => (
               <button
                 key={s.med.id}
@@ -997,12 +1168,20 @@ export default function App() {
                     : "border-slate-300 bg-white text-slate-700 hover:bg-slate-50")
                 }
               >
-                ✏️ {s.med.name || "(ohne Namen)"} bearbeiten
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" className="inline h-3.5 w-3.5" fill="none" stroke="#7b1e3a" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+  <path d="M12 20h9" />
+  <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z" />
+</svg> 
+{[
+                  s.med.name || "(ohne Namen)",
+                  s.med.retard ? "ret." : "unret.",
+                  strengthText(s.med),
+                  s.med.form,
+                ].filter(Boolean).join(" · ")} bearbeiten
               </button>
             ))}
           </div>
         )}
-
         {/* Abgewählte (inaktive) Medikamente */}
         {inactive.length > 0 && (
           <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
