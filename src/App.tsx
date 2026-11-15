@@ -252,28 +252,6 @@ function defaultMed(): Med {
   };
 }
 
-function seedMeds(): Med[] {
-  const base = defaultMed();
-  return [
-    {
-      ...base, id: newId(), name: "Hygroton 25 mg", form: "tabletten", packLabel: "N3",
-      packUnits: 100, packsAtHome: 1, currentStock: 5, stockAsOf: todayISO(),
-      doses: { mo: 1, di: 1, mi: 1, do: 1, fr: 1, sa: 1, so: 1 },
-      price: 23.5, pickupSelf: false, reps: ["Apotheken-Botendienst", "", ""],
-      strength: 25, strengthUnit: "mg", retard: false,
-      note: "Beispiel – bitte anpassen.",
-    },
-    {
-      ...base, id: newId(), name: "Levothyroxin 100 µg", form: "tabletten", packLabel: "N3",
-      packUnits: 100, packsAtHome: 2, currentStock: 62, stockAsOf: todayISO(),
-      doses: { mo: 1, di: 1, mi: 1, do: 1, fr: 1, sa: 1, so: 1 },
-      price: 18.9, pickupSelf: false, reps: ["Ehepartner", "", ""],
-      strength: 100, strengthUnit: "u", retard: false,
-      note: "Beispiel – bitte anpassen.",
-    },
-  ];
-}
-
 function normalizeMed(raw: Partial<Med>): Med {
   const base = defaultMed();
   const m: Med = { ...base, ...raw };
@@ -308,36 +286,7 @@ function normalizeMed(raw: Partial<Med>): Med {
   return m;
 }
 
-const STORE_KEY = "medikamentenplaner-v1";
-
-function loadStore(): { meds: Med[]; settings: Settings } {
-  try {
-    let raw = localStorage.getItem(STORE_KEY);
-    if (!raw) {
-      const legacy = localStorage.getItem("medikamenten-planer-v1");
-      if (legacy) {
-        localStorage.setItem(STORE_KEY, legacy);
-        raw = legacy;
-      }
-    }
-    if (raw) {
-      const parsed = JSON.parse(raw);
-      if (parsed && Array.isArray(parsed.meds)) {
-        return {
-          meds: parsed.meds.map((x: unknown) => normalizeMed(x as Partial<Med>)),
-                                  settings: {
-                          haertefall: parsed.settings ? !!parsed.settings.haertefall : true,
-                          state: parsed.settings?.state || "BY",
-                          insurance: parsed.settings?.insurance === "private" ? "private" : "statutory",
-                        },
-        };
-      }
-    }
-  } catch {
-    /* ignore */
-  }
-  return { meds: seedMeds(), settings: { haertefall: true, state: "BY", insurance: "statutory" } };
-}// ---------------- UI-Bausteine ----------------
+// ---------------- UI-Bausteine ----------------
 
 const STATUS_STYLES: Record<Schedule["status"], { label: string; cls: string }> = {
   leer: { label: "leer!", cls: "bg-red-100 text-red-800 border-red-300" },
@@ -849,16 +798,41 @@ function MedForm({ draft, onSave, onCancel, onDelete }: {
 // ---------------- App ----------------
 
 export default function App() {
-  const [store, setStore] = useState(loadStore);
+    const [store, setStore] = useState<{ meds: Med[]; settings: Settings }>({
+    meds: [],
+    settings: { haertefall: true, state: "BY", insurance: "statutory" },
+  });
   const { meds, settings } = store;
   const [draft, setDraft] = useState<Med | null>(null);
   const [editId, setEditId] = useState<string | null>(null);
+
   useEffect(() => {
-    try {
-      localStorage.setItem(STORE_KEY, JSON.stringify(store));
-    } catch {
-      /* ignore */
-    }
+    fetch("/api/meds")
+      .then((r) => r.json())
+      .then((rows) => {
+        if (!Array.isArray(rows) || rows.length === 0) return;
+        const row = rows.find((r: { id: string }) => r.id === "all");
+        if (!row) return;
+        const parsed = JSON.parse(row.data);
+        setStore({
+          meds: (parsed.meds || []).map((m: unknown) => normalizeMed(m as Partial<Med>)),
+          settings: {
+            haertefall: parsed.settings?.haertefall ?? true,
+            state: parsed.settings?.state || "BY",
+            insurance: parsed.settings?.insurance === "private" ? "private" : "statutory",
+          },
+        });
+      })
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (store.meds.length === 0) return;
+    fetch("/api/meds", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: "all", data: JSON.stringify(store) }),
+    }).catch(() => {});
   }, [store]);
 
     const schedules = useMemo(
